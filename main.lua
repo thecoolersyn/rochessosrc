@@ -45,6 +45,13 @@ if type(CFG) ~= "table" then
 	CFG = {}
 end
 GENV.__ROCHESS_CFG = CFG
+-- load persisted online setting from file
+if type(readfile) == "function" then
+	local ok, val = pcall(readfile, "rochess_online.txt")
+	if ok and type(val) == "string" then
+		CFG.online = (val:match("^%s*true%s* ) ~= nil)
+	end
+end
 
 local DEFAULTS = {
 	autoplay = false,
@@ -684,6 +691,14 @@ local function onAutoplayChanged(on)
 	MOVE_PLY = nil
 end
 
+local function onOnlineChanged(on)
+	CFG.online = (on == true)
+	-- persist to file
+	if type(writefile) == "function" then
+		pcall(writefile, "rochess_online.txt", CFG.online and "true" or "false")
+	end
+end
+
 local function onOverlayChanged(on)
 	CFG.overlay = (on == true)
 	if not CFG.overlay then
@@ -867,6 +882,7 @@ local function buildUI(lib)
 	CTRL.ONLINE = autoMod:AddToggle({
 		Name = "Allow online games",
 		Default = CFG.online,
+		Callback = onOnlineChanged,
 	})
 	autoMod:AddButton({
 		Name = "Play best move now",
@@ -875,7 +891,7 @@ local function buildUI(lib)
 
 	-- Auto Match -----------------------------------------------------------
 	local autoMatchMod = playTab:AddModule({
-		Name = "Auto New Game",
+		Name = "Auto Queue",
 		Default = CFG.autoMatch == true,
 		NotifyOnToggle = true,
 		Callback = function(on)
@@ -1111,6 +1127,8 @@ API.play = onPlayNow
 API.set = function(name, value)
 	if name == "autoplay" then
 		CFG.autoplay = (value == true)
+	elseif name == "online" then
+		CFG.online = (value == true)
 	end
 end
 
@@ -1137,15 +1155,33 @@ local function triggerRematch()
 	if type(app) ~= "table" then
 		return false, "no app"
 	end
-	if type(app.startBotGame) ~= "function" then
-		return false, "startBotGame unavailable"
+	-- Find the randomized queue remote dynamically
+	local chess = game:GetService("ReplicatedStorage"):FindFirstChild("Chess")
+	local queueRemote = nil
+	if chess then
+		for _, child in ipairs(chess:GetChildren()) do
+			if child:IsA("Folder") and #child.Name == 10 then
+				for _, r in ipairs(child:GetChildren()) do
+					if r:IsA("RemoteEvent") then
+						queueRemote = r
+						break
+					end
+				end
+				if queueRemote then break end
+			end
+		end
+	end
+	if not queueRemote then
+		return false, "queue remote not found"
 	end
 	AUTO_MATCH_COOLDOWN = now
-	local ok, err = pcall(app.startBotGame)
+	local ok, err = pcall(function()
+		queueRemote:FireServer({type = "queue", tc = "3+2"})
+	end)
 	if not ok then
 		return false, tostring(err)
 	end
-	return true, "started new bot game"
+	return true, "queued online 3+2"
 end
 
 local function triggerRematchOffer()
@@ -1258,7 +1294,7 @@ task.spawn(function()
 	end
 end)
 
-print("[RoChess] auto-execute queued, auto new game " .. (AUTO_MATCH and "ON" or "OFF"))
+print("[RoChess] auto-execute queued, auto queue " .. (AUTO_MATCH and "ON" or "OFF"))
 OnCleanup(function()
 	RUNNING = false
 end)
