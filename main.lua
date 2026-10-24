@@ -49,7 +49,7 @@ GENV.__ROCHESS_CFG = CFG
 if type(readfile) == "function" then
 	local ok, val = pcall(readfile, "rochess_online.txt")
 	if ok and type(val) == "string" then
-		CFG.online = (val:match("^%s*true%s* ) ~= nil)
+		CFG.online = (string.find(val, "true") ~= nil)
 	end
 end
 
@@ -1129,6 +1129,9 @@ API.set = function(name, value)
 		CFG.autoplay = (value == true)
 	elseif name == "online" then
 		CFG.online = (value == true)
+		if type(writefile) == "function" then
+			pcall(writefile, "rochess_online.txt", CFG.online and "true" or "false")
+		end
 	end
 end
 
