@@ -52,6 +52,15 @@ if type(readfile) == "function" then
 		CFG.online = (string.find(val, "true") ~= nil)
 	end
 end
+-- load persisted autoplay/auto-match flags so they survive a teleport
+if type(readfile) == "function" then
+	local okF, valF = pcall(readfile, "rochess_flags.txt")
+	if okF and type(valF) == "string" then
+		CFG.autoplay = (string.find(valF, "autoplay=true", 1, true) ~= nil)
+		CFG.autoMatch = (string.find(valF, "automatch=true", 1, true) ~= nil)
+		CFG.autoExec = (string.find(valF, "autoexec=true", 1, true) ~= nil)
+	end
+end
 
 local DEFAULTS = {
 	autoplay = false,
@@ -67,6 +76,7 @@ local DEFAULTS = {
 	accent = "Cyan",
 	autoMatch = false,
 	autoRematch = false,
+	autoExec = false,
 }
 for k, v in pairs(DEFAULTS) do
 	if CFG[k] == nil then
@@ -152,6 +162,7 @@ local MOVE_PLY = nil
 local FAIL_KEY = nil
 local RUNNING = true
 local STATUS = nil
+local autoMatchTick
 
 local PROMO = { q = 5, r = 4, b = 3, n = 2 }
 
@@ -686,9 +697,20 @@ local function notify(title, text)
 	})
 end
 
+local function saveFlags()
+	if type(writefile) ~= "function" then
+		return
+	end
+	pcall(writefile, "rochess_flags.txt",
+		"autoplay=" .. tostring(CFG.autoplay == true)
+		.. "\nautomatch=" .. tostring(CFG.autoMatch == true)
+		.. "\nautoexec=" .. tostring(CFG.autoExec == true))
+end
+
 local function onAutoplayChanged(on)
 	CFG.autoplay = (on == true)
 	MOVE_PLY = nil
+	saveFlags()
 end
 
 local function onOnlineChanged(on)
@@ -855,7 +877,7 @@ local function buildUI(lib)
 
 	local autoMod = playTab:AddModule({
 		Name = "Autoplay",
-		Default = false,
+		Default = CFG.autoplay == true,
 		NotifyOnToggle = true,
 		Callback = onAutoplayChanged,
 	})
@@ -914,14 +936,16 @@ local function buildUI(lib)
 	-- Auto Execute ---------------------------------------------------------
 	local autoExecMod = playTab:AddModule({
 		Name = "Auto Execute",
-		Default = false,
-	})
-	autoExecMod:AddButton({
-		Name = "Queue auto-execute",
-		Callback = function()
-			local ok, msg = GENV.__rochess.queueAutoExecute()
+		Default = CFG.autoExec == true,
+		NotifyOnToggle = true,
+		Callback = function(on)
+			local ok, msg = GENV.__rochess.autoExec(on == true)
 			if ok then
-				notify("RoChess", "auto-execute queued")
+				if on then
+					notify("RoChess", "auto-execute queued for next teleport")
+				else
+					notify("RoChess", "auto-execute off")
+				end
 			else
 				notify("RoChess", "queue failed: " .. tostring(msg))
 			end
@@ -1000,6 +1024,7 @@ local function hideOverlay()
 end
 
 local function tick()
+	pcall(autoMatchTick)
 	syncSettings()
 	guardSearchHook()
 	local app = resolveModules()
@@ -1151,14 +1176,25 @@ local function triggerRematch()
 		return false, "auto match disabled"
 	end
 	local now = os.clock()
-	if now - AUTO_MATCH_COOLDOWN < 5 then
+	if now - AUTO_MATCH_COOLDOWN < 10 then
 		return false, "cooldown"
 	end
 	local app = resolveModules()
 	if type(app) ~= "table" then
 		return false, "no app"
 	end
-	-- Find the randomized queue remote dynamically
+	-- prefer the game's own matchmaking entry point
+	if type(app.startSearch) == "function" then
+		AUTO_MATCH_COOLDOWN = now
+		local ok, err = pcall(app.startSearch, "3+2")
+		if not ok then
+			LOG = "auto queue failed: " .. tostring(err)
+			return false, tostring(err)
+		end
+		LOG = "auto queue: searching 3+2"
+		return true, "queued online 3+2"
+	end
+	-- fallback: find the randomized queue remote dynamically
 	local chess = game:GetService("ReplicatedStorage"):FindFirstChild("Chess")
 	local queueRemote = nil
 	if chess then
@@ -1228,7 +1264,7 @@ local function autoRematchTick()
 	triggerRematchOffer()
 end
 
-local function autoMatchTick()
+autoMatchTick = function()
 	if not AUTO_MATCH then
 		return
 	end
@@ -1237,12 +1273,15 @@ local function autoMatchTick()
 		return
 	end
 	local s = app.session
-	if type(s) ~= "table" then
+	-- live game still running: nothing to queue yet
+	if type(s) == "table" and not s.over and s.kind ~= "idle" then
 		return
 	end
-	if not s.over then
+	-- matchmaking already in flight
+	if type(s) == "table" and s.joining == true then
 		return
 	end
+	-- lobby (kind == "idle"), finished game (s.over) or no session at all
 	triggerRematch()
 end
 
@@ -1250,6 +1289,14 @@ API.autoMatch = function(enabled)
 	AUTO_MATCH = (enabled == true)
 	if enabled ~= nil then
 		CFG.autoMatch = AUTO_MATCH
+	end
+	saveFlags()
+	-- toggling off should also abort a search that is already in flight
+	if not AUTO_MATCH then
+		local app = resolveModules()
+		if type(app) == "table" and type(app.cancelSearch) == "function" then
+			pcall(app.cancelSearch)
+		end
 	end
 end
 
@@ -1283,12 +1330,14 @@ end
 
 API.queueAutoExecute = queueAutoExecute
 
-task.spawn(function()
-	while harnessAlive() and RUNNING do
-		task.wait(1)
-		pcall(autoMatchTick)
+API.autoExec = function(enabled)
+	CFG.autoExec = (enabled == true)
+	saveFlags()
+	if not CFG.autoExec then
+		return true, "auto-execute off"
 	end
-end)
+	return queueAutoExecute()
+end
 
 task.spawn(function()
 	while harnessAlive() and RUNNING do
@@ -1297,7 +1346,19 @@ task.spawn(function()
 	end
 end)
 
-print("[RoChess] auto-execute queued, auto queue " .. (AUTO_MATCH and "ON" or "OFF"))
+if CFG.autoExec then
+	task.spawn(function()
+		local okQ, msgQ = queueAutoExecute()
+		if okQ then
+			print("[RoChess] auto-execute re-queued on load")
+		else
+			warn("[RoChess] auto-execute re-queue failed: " .. tostring(msgQ))
+		end
+	end)
+end
+print("[RoChess] loaded: autoplay " .. (CFG.autoplay and "ON" or "OFF")
+	.. ", auto queue " .. (AUTO_MATCH and "ON" or "OFF")
+	.. ", auto execute " .. (CFG.autoExec and "ON" or "OFF"))
 OnCleanup(function()
 	RUNNING = false
 end)
@@ -1338,5 +1399,6 @@ return {
 	play = API.play,
 	autoMatch = API.autoMatch,
 	autoRematch = API.autoRematch,
+	autoExec = API.autoExec,
 	queueAutoExecute = API.queueAutoExecute,
 }
